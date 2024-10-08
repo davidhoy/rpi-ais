@@ -1,0 +1,17 @@
+[Unit]
+Description=AIS Forwarder Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ais_forwarder
+Restart=on-failure
+User=nobody
+Group=nogroup
+StandardOutput=null
+StandardError=journal
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

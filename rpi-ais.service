@@ -1,0 +1,11 @@
+[Unit]
+Description=AIS MarineTraffic Relay Service
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+ExecStart=/home/david/rpi-ais/build/ais_forwarder
+
+[Install]
+WantedBy=multi-user.target

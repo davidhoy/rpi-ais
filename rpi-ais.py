@@ -3,7 +3,7 @@
 # Should run on an machine with a Python 3 interpreter, but
 # tested extensively on a Raspberry Pi Zero W.
 #
-# This assumes that you have alreadty configured you Pi
+# This assumes that you have already configured you Pi
 # to connect to your local WiFi network.
 
 import socket
@@ -11,7 +11,7 @@ import sys
 
 # Create a TCP socket, and connect to AIS data stream
 ais_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-ais_address = ('<insert Vesper IP address here>', 39150)
+ais_address = ('192.168.50.37', 39150)
 print('Connecting to AIS at %s port %s' % ais_address)
 ais_sock.connect(ais_address)
 ais_file = ais_sock.makefile()
@@ -20,7 +20,7 @@ ais_file = ais_sock.makefile()
 # MT will assign you an IP address and port number when you
 # register your station with them.
 mt_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-mt_address = ('<insert MT IP address here>', <insert MT port # here>)
+mt_address = ('5.9.207.224', 10170)
 print('Connecting to MarineTraffic at %s port %s' % mt_address)
 
 # Loop forever
