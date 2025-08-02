@@ -51,7 +51,7 @@ void daemonize() {
 
 int main() {
     // Daemonize this process
-    daemonize();
+    //daemonize();
 
     // TCP Socket for AIS
     int ais_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -94,7 +94,7 @@ int main() {
         ssize_t bytes_received = recv(ais_sock, buffer, sizeof(buffer) - 1, 0);
         if (bytes_received < 0) {
             std::cerr << "Error reading from AIS socket" << std::endl;
-            break;
+            continue;
         }
 
         // Null-terminate the string

@@ -5,6 +5,8 @@ After=network.target
 [Service]
 Type=simple
 Restart=always
+User=david
+WorkingDirectory=/home/david/rpi-ais/build
 ExecStart=/home/david/rpi-ais/build/ais_forwarder
 
 [Install]
