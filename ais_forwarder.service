@@ -6,10 +6,15 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/ais_forwarder
 Restart=on-failure
-User=nobody
-Group=nogroup
-StandardOutput=null
+RestartSec=30
+StartLimitInterval=300
+StartLimitBurst=5
+User=david
+Group=david
+Environment=DISPLAY=:0
+StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=ais_forwarder
 KillMode=control-group
 TimeoutStopSec=10
 
