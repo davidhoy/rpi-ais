@@ -39,14 +39,43 @@ cmake ..
 make
 ```
 
-### 2. Install Binary
+### 2. Create Configuration (Optional)
+
+The service can be configured in multiple ways with the following priority:
+**Command line arguments > Environment variables > Config file > Default values**
+
+#### Option 1: Configuration File
+
+```bash
+# Copy sample config and edit
+cp ../ais_forwarder.conf /etc/ais_forwarder.conf
+sudo nano /etc/ais_forwarder.conf
+```
+
+#### Option 2: Environment Variables
+
+```bash
+export AIS_IP=192.168.50.37
+export AIS_PORT=39150
+export MT_IP=5.9.207.224
+export MT_PORT=10170
+export NOTIFICATION_USER=david
+```
+
+#### Option 3: Command Line Arguments
+
+```bash
+./ais_forwarder --ais-ip 192.168.50.37 --ais-port 39150 --user david
+```
+
+### 3. Install Binary
 
 ```bash
 sudo cp ais_forwarder /usr/local/bin/ais_forwarder
 sudo chmod +x /usr/local/bin/ais_forwarder
 ```
 
-### 3. Install and Enable Service
+### 4. Install and Enable Service
 
 ```bash
 sudo cp ../ais_forwarder.service /etc/systemd/system/
@@ -57,18 +86,22 @@ sudo systemctl start ais_forwarder.service
 
 ## Configuration
 
-### Default Endpoints
+### Configuration Parameters
 
-- **AIS Transponder**: `192.168.50.37:39150` (TCP)
-- **MarineTraffic**: `5.9.207.224:10170` (UDP)
+All configuration values can be set via command line, environment variables, or config file:
 
-To change these endpoints, modify the constants in `src/ais_forwarder.cpp`:
+| Parameter | Config File | Environment | Command Line | Default |
+|-----------|-------------|-------------|--------------|---------|
+| AIS IP | `ais_ip` | `AIS_IP` | `--ais-ip` | `192.168.50.37` |
+| AIS Port | `ais_port` | `AIS_PORT` | `--ais-port` | `39150` |
+| MarineTraffic IP | `mt_ip` | `MT_IP` | `--mt-ip` | `5.9.207.224` |
+| MarineTraffic Port | `mt_port` | `MT_PORT` | `--mt-port` | `10170` |
+| Notification User | `notification_user` | `NOTIFICATION_USER` | `--user` | `david` |
 
-```cpp
-const char* AIS_IP = "192.168.50.37";
-const int AIS_PORT = 39150;
-const char* MT_IP = "5.9.207.224";
-const int MT_PORT = 10170;
+### View All Options
+
+```bash
+./ais_forwarder --help
 ```
 
 ### Service Configuration

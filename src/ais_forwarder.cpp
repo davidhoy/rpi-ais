@@ -41,22 +41,108 @@
 #include <sys/select.h>
 #include <errno.h>
 #include <netinet/tcp.h>
+#include <getopt.h>
 
-// Address and port for AIS and MarineTraffic
-const char* AIS_IP = "192.168.50.37";       // My AIS' IP address on local network
-const int AIS_PORT = 39150;                 // My AIS' port
-const char* MT_IP = "5.9.207.224";          // MarineTraffic IP address (custom)
-const int MT_PORT = 10170;                  // MarineTraffic port (custom)
+// Configuration structure
+struct Config {
+    std::string ais_ip = "192.168.50.37";     // Default AIS IP
+    int ais_port = 39150;                      // Default AIS port
+    std::string mt_ip = "5.9.207.224";        // Default MarineTraffic IP
+    int mt_port = 10170;                       // Default MarineTraffic port
+    std::string notification_user = "david";   // User for desktop notifications
+    std::string config_file = "";             // Optional config file path
+};
+
+// Function to load configuration from file
+bool load_config_file(const std::string& filename, Config& config) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        return false;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip comments and empty lines
+        if (line.empty() || line[0] == '#') continue;
+        
+        size_t eq_pos = line.find('=');
+        if (eq_pos == std::string::npos) continue;
+        
+        std::string key = line.substr(0, eq_pos);
+        std::string value = line.substr(eq_pos + 1);
+        
+        // Trim whitespace
+        key.erase(0, key.find_first_not_of(" \t"));
+        key.erase(key.find_last_not_of(" \t") + 1);
+        value.erase(0, value.find_first_not_of(" \t"));
+        value.erase(value.find_last_not_of(" \t") + 1);
+        
+        if (key == "ais_ip") config.ais_ip = value;
+        else if (key == "ais_port") config.ais_port = std::stoi(value);
+        else if (key == "mt_ip") config.mt_ip = value;
+        else if (key == "mt_port") config.mt_port = std::stoi(value);
+        else if (key == "notification_user") config.notification_user = value;
+    }
+    
+    return true;
+}
+
+// Function to load configuration from environment variables
+void load_env_config(Config& config) {
+    const char* env_val;
+    
+    if ((env_val = getenv("AIS_IP")) != nullptr) {
+        config.ais_ip = env_val;
+    }
+    if ((env_val = getenv("AIS_PORT")) != nullptr) {
+        config.ais_port = std::stoi(env_val);
+    }
+    if ((env_val = getenv("MT_IP")) != nullptr) {
+        config.mt_ip = env_val;
+    }
+    if ((env_val = getenv("MT_PORT")) != nullptr) {
+        config.mt_port = std::stoi(env_val);
+    }
+    if ((env_val = getenv("NOTIFICATION_USER")) != nullptr) {
+        config.notification_user = env_val;
+    }
+}
+
+// Function to show usage information
+void show_usage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " [OPTIONS]\n"
+              << "\nOptions:\n"
+              << "  -h, --help                 Show this help message\n"
+              << "  -c, --config FILE          Load configuration from file\n"
+              << "  -a, --ais-ip IP            AIS transponder IP address\n"
+              << "  -p, --ais-port PORT        AIS transponder port\n"
+              << "  -m, --mt-ip IP             MarineTraffic server IP address\n"
+              << "  -t, --mt-port PORT         MarineTraffic server port\n"
+              << "  -u, --user USER            User for desktop notifications\n"
+              << "\nEnvironment Variables:\n"
+              << "  AIS_IP                     AIS transponder IP address\n"
+              << "  AIS_PORT                   AIS transponder port\n"
+              << "  MT_IP                      MarineTraffic server IP address\n"
+              << "  MT_PORT                    MarineTraffic server port\n"
+              << "  NOTIFICATION_USER          User for desktop notifications\n"
+              << "\nConfiguration File Format:\n"
+              << "  ais_ip=192.168.50.37\n"
+              << "  ais_port=39150\n"
+              << "  mt_ip=5.9.207.224\n"
+              << "  mt_port=10170\n"
+              << "  notification_user=david\n"
+              << "\nPriority: Command line > Environment > Config file > Defaults\n";
+}
 
 // Function to send system notification
-void send_notification(const std::string& title, const std::string& message, const std::string& urgency = "normal") {
+void send_notification(const std::string& title, const std::string& message, const std::string& notification_user, const std::string& urgency = "normal") {
     // Always log to syslog for reliable notification
     std::string syslog_command = "logger -t ais_forwarder \"" + title + ": " + message + "\"";
     system(syslog_command.c_str());
     
     // Try to send desktop notification to active user sessions
     // This works better for systemd services
-    std::string desktop_notify = "sudo -u david DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u david)/bus notify-send --urgency=" + urgency + " \"" + title + "\" \"" + message + "\" 2>/dev/null || true";
+    std::string desktop_notify = "sudo -u " + notification_user + " DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u " + notification_user + ")/bus notify-send --urgency=" + urgency + " \"" + title + "\" \"" + message + "\" 2>/dev/null || true";
     system(desktop_notify.c_str());
 }
 
@@ -130,12 +216,12 @@ bool is_connection_alive(int socket_fd) {
 }
 
 // Function to create and connect AIS socket
-int connect_to_ais() {
+int connect_to_ais(const Config& config) {
     int ais_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (ais_sock == -1) {
         std::string error_msg = "Error creating AIS socket";
         std::cerr << get_timestamp() << " - " << error_msg << std::endl;
-        send_notification("AIS Socket Error", error_msg, "critical");
+        send_notification("AIS Socket Error", error_msg, config.notification_user, "critical");
         return -1;
     }
 
@@ -157,8 +243,8 @@ int connect_to_ais() {
     // Define AIS address
     struct sockaddr_in ais_addr;
     ais_addr.sin_family = AF_INET;
-    ais_addr.sin_port = htons(AIS_PORT);
-    inet_pton(AF_INET, AIS_IP, &ais_addr.sin_addr);
+    ais_addr.sin_port = htons(config.ais_port);
+    inet_pton(AF_INET, config.ais_ip.c_str(), &ais_addr.sin_addr);
 
     // Connect to AIS
     if (connect(ais_sock, (struct sockaddr*)&ais_addr, sizeof(ais_addr)) < 0) {
@@ -214,7 +300,83 @@ void daemonize() {
     close(STDERR_FILENO);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    Config config;
+    
+    // Command line options
+    static struct option long_options[] = {
+        {"help", no_argument, 0, 'h'},
+        {"config", required_argument, 0, 'c'},
+        {"ais-ip", required_argument, 0, 'a'},
+        {"ais-port", required_argument, 0, 'p'},
+        {"mt-ip", required_argument, 0, 'm'},
+        {"mt-port", required_argument, 0, 't'},
+        {"user", required_argument, 0, 'u'},
+        {0, 0, 0, 0}
+    };
+    
+    // Parse command line arguments
+    int option_index = 0;
+    int c;
+    
+    while ((c = getopt_long(argc, argv, "hc:a:p:m:t:u:", long_options, &option_index)) != -1) {
+        switch (c) {
+            case 'h':
+                show_usage(argv[0]);
+                return 0;
+            case 'c':
+                config.config_file = optarg;
+                break;
+            case 'a':
+                config.ais_ip = optarg;
+                break;
+            case 'p':
+                config.ais_port = std::stoi(optarg);
+                break;
+            case 'm':
+                config.mt_ip = optarg;
+                break;
+            case 't':
+                config.mt_port = std::stoi(optarg);
+                break;
+            case 'u':
+                config.notification_user = optarg;
+                break;
+            case '?':
+                show_usage(argv[0]);
+                return 1;
+            default:
+                break;
+        }
+    }
+    
+    // Load configuration in priority order: defaults -> config file -> environment -> command line
+    
+    // 1. Load from config file if specified
+    if (!config.config_file.empty()) {
+        if (!load_config_file(config.config_file, config)) {
+            std::cerr << "Warning: Could not load config file: " << config.config_file << std::endl;
+        }
+    } else {
+        // Try default config file locations
+        if (load_config_file("/etc/ais_forwarder.conf", config)) {
+            std::cout << get_timestamp() << " - Loaded configuration from /etc/ais_forwarder.conf" << std::endl;
+        } else if (load_config_file("./ais_forwarder.conf", config)) {
+            std::cout << get_timestamp() << " - Loaded configuration from ./ais_forwarder.conf" << std::endl;
+        }
+    }
+    
+    // 2. Override with environment variables
+    load_env_config(config);
+    
+    // 3. Command line arguments already parsed and override everything
+    
+    // Print configuration
+    std::cout << get_timestamp() << " - Configuration:" << std::endl;
+    std::cout << "  AIS: " << config.ais_ip << ":" << config.ais_port << std::endl;
+    std::cout << "  MarineTraffic: " << config.mt_ip << ":" << config.mt_port << std::endl;
+    std::cout << "  Notification User: " << config.notification_user << std::endl;
+
     // UDP Socket for MarineTraffic
     int mt_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (mt_sock == -1) {
@@ -225,8 +387,8 @@ int main() {
     // Define MarineTraffic address
     struct sockaddr_in mt_addr;
     mt_addr.sin_family = AF_INET;
-    mt_addr.sin_port = htons(MT_PORT);
-    inet_pton(AF_INET, MT_IP, &mt_addr.sin_addr);
+    mt_addr.sin_port = htons(config.mt_port);
+    inet_pton(AF_INET, config.mt_ip.c_str(), &mt_addr.sin_addr);
 
     int ais_sock = -1;
     bool was_connected = false;  // Track previous connection state
@@ -237,19 +399,19 @@ int main() {
         // Try to establish/maintain AIS connection
         if (ais_sock == -1) {
             std::cout << get_timestamp() << " - Attempting to connect to AIS transponder..." << std::endl;
-            ais_sock = connect_to_ais();
+            ais_sock = connect_to_ais(config);
             
             if (ais_sock != -1) {
-                std::string success_msg = "Successfully connected to AIS transponder at " + std::string(AIS_IP) + ":" + std::to_string(AIS_PORT);
+                std::string success_msg = "Successfully connected to AIS transponder at " + config.ais_ip + ":" + std::to_string(config.ais_port);
                 std::cout << get_timestamp() << " - " << success_msg << std::endl;
                 
                 // Only send notification if we had a previous connection (reconnection)
                 // or if this is the first successful connection after failed attempts
                 if (was_connected || connection_lost_notified) {
-                    send_notification("AIS Connection Restored", success_msg, "normal");
+                    send_notification("AIS Connection Restored", success_msg, config.notification_user, "normal");
                 } else {
                     // First time connecting since service start
-                    send_notification("AIS Forwarder Started", success_msg, "normal");
+                    send_notification("AIS Forwarder Started", success_msg, config.notification_user, "normal");
                 }
                 
                 was_connected = true;
@@ -259,8 +421,8 @@ int main() {
                 // Connection failed
                 if (was_connected && !connection_lost_notified) {
                     // We had a connection before and haven't notified about the loss yet
-                    std::string error_msg = "Failed to reconnect to AIS transponder at " + std::string(AIS_IP) + ":" + std::to_string(AIS_PORT);
-                    send_notification("AIS Connection Failed", error_msg, "critical");
+                    std::string error_msg = "Failed to reconnect to AIS transponder at " + config.ais_ip + ":" + std::to_string(config.ais_port);
+                    send_notification("AIS Connection Failed", error_msg, config.notification_user, "critical");
                     connection_lost_notified = true;
                 }
                 // Wait before retrying (no notification spam)
@@ -285,7 +447,7 @@ int main() {
                     
                     // Send notification only once when connection is lost
                     if (!connection_lost_notified) {
-                        send_notification("AIS Connection Lost", error_msg, "critical");
+                        send_notification("AIS Connection Lost", error_msg, config.notification_user, "critical");
                         connection_lost_notified = true;
                     }
                     
@@ -315,7 +477,7 @@ int main() {
                 
                 // Send notification only once when connection is lost
                 if (!connection_lost_notified) {
-                    send_notification("AIS Connection Error", error_msg, "critical");
+                    send_notification("AIS Connection Error", error_msg, config.notification_user, "critical");
                     connection_lost_notified = true;
                 }
                 
@@ -339,7 +501,7 @@ int main() {
                 
                 // Send notification only once when connection is lost
                 if (!connection_lost_notified) {
-                    send_notification("AIS Connection Lost", error_msg, "critical");
+                    send_notification("AIS Connection Lost", error_msg, config.notification_user, "critical");
                     connection_lost_notified = true;
                 }
                 
@@ -356,7 +518,7 @@ int main() {
                 
                 // Send notification only once when connection is lost
                 if (!connection_lost_notified) {
-                    send_notification("AIS Connection Closed", error_msg, "critical");
+                    send_notification("AIS Connection Closed", error_msg, config.notification_user, "critical");
                     connection_lost_notified = true;
                 }
                 
