@@ -261,6 +261,53 @@ private:
     std::unordered_map<std::string, std::pair<bool, std::chrono::steady_clock::time_point>> multipart_;
 };
 
+// Drops AIS sentences that are channel-A/B duplicates of the same transmission.
+// AIS receivers listen on both VHF channels simultaneously; the same vessel
+// message often arrives on both within milliseconds with identical payloads.
+// Two sentences with the same payload within ttl_ms are treated as one.
+class PayloadDeduplicator {
+public:
+    explicit PayloadDeduplicator(int ttl_ms = 2000) : ttl_ms_(ttl_ms) {}
+
+    // Returns true if the sentence is new and should be forwarded.
+    bool is_new(const std::string& nmea) {
+        // Extract payload (field 5) using the same field-split as MmsiRateLimiter
+        size_t f[6] = {0};
+        int n = 1;
+        for (size_t i = 0; i < nmea.size() && n < 6; ++i) {
+            if (nmea[i] == ',') f[n++] = i + 1;
+        }
+        if (n < 6) return true;  // Malformed — forward
+
+        size_t payload_end = nmea.find(',', f[5]);
+        if (payload_end == std::string::npos) payload_end = nmea.size();
+        std::string payload = nmea.substr(f[5], payload_end - f[5]);
+        if (payload.empty()) return true;
+
+        auto now = std::chrono::steady_clock::now();
+        auto it = seen_.find(payload);
+        if (it != seen_.end()) {
+            if (now - it->second < std::chrono::milliseconds(ttl_ms_))
+                return false;  // Duplicate within window
+            it->second = now;
+            return true;
+        }
+        seen_[payload] = now;
+        return true;
+    }
+
+    void cleanup() {
+        auto now = std::chrono::steady_clock::now();
+        auto stale = std::chrono::milliseconds(ttl_ms_);
+        for (auto it = seen_.begin(); it != seen_.end(); )
+            it = (now - it->second >= stale) ? seen_.erase(it) : ++it;
+    }
+
+private:
+    int ttl_ms_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> seen_;
+};
+
 // Function to set socket timeout
 bool set_socket_timeout(int socket_fd, int timeout_seconds) {
     struct timeval timeout;
@@ -501,6 +548,7 @@ int main(int argc, char* argv[]) {
     inet_pton(AF_INET, config.mt_ip.c_str(), &mt_addr.sin_addr);
 
     MmsiRateLimiter limiter(config.rate_limit_seconds);
+    PayloadDeduplicator deduplicator;
     auto last_cleanup = std::chrono::steady_clock::now();
     const auto cleanup_interval = std::chrono::minutes(5);
 
@@ -554,6 +602,7 @@ int main(int argc, char* argv[]) {
             auto now = std::chrono::steady_clock::now();
             if (now - last_cleanup >= cleanup_interval) {
                 limiter.cleanup();
+                deduplicator.cleanup();
                 last_cleanup = now;
             }
             if (now - last_health_check >= health_check_interval) {
@@ -661,7 +710,7 @@ int main(int argc, char* argv[]) {
 
                 // Filter out unwanted messages
                 if (nmea_str.rfind("!AIVDM", 0) == 0 || nmea_str.rfind("!AIVDO", 0) == 0) {
-                    if (limiter.should_forward(nmea_str)) {
+                    if (deduplicator.is_new(nmea_str) && limiter.should_forward(nmea_str)) {
                         sendto(mt_sock, nmea_str.c_str(), nmea_str.size(), 0, (struct sockaddr*)&mt_addr, sizeof(mt_addr));
                     }
                 }
