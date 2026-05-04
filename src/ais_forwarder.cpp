@@ -724,26 +724,27 @@ int main(int argc, char* argv[]) {
             }
 
             // Process received data
-            buffer[bytes_received] = '\0';
-            leftover += std::string(buffer);
-            
-            // Split the string by '\r\n' to extract complete NMEA sentences
-            size_t pos = 0;
-            std::string delimiter = "\r\n";
-            while ((pos = leftover.find(delimiter)) != std::string::npos) {
-                // Extract a complete NMEA sentence
-                std::string nmea_str = leftover.substr(0, pos);
+            leftover.append(buffer, bytes_received);
 
-                // Remove the extracted sentence from the leftover string
-                leftover.erase(0, pos + delimiter.length());
+            // Split the string by '\r\n' to extract complete NMEA sentences.
+            // Use a read offset to avoid O(n²) erase-per-sentence; one erase at the end.
+            size_t start = 0;
+            size_t pos;
+            while ((pos = leftover.find("\r\n", start)) != std::string::npos) {
+                std::string nmea_str = leftover.substr(start, pos - start);
+                start = pos + 2;
 
                 // Filter out unwanted messages
                 if (nmea_str.rfind("!AIVDM", 0) == 0 || nmea_str.rfind("!AIVDO", 0) == 0) {
                     if (deduplicator.is_new(nmea_str) && limiter.should_forward(nmea_str)) {
-                        sendto(mt_sock, nmea_str.c_str(), nmea_str.size(), 0, (struct sockaddr*)&mt_addr, sizeof(mt_addr));
+                        // Restore NMEA-standard \r\n terminator stripped during parsing
+                        std::string to_send = nmea_str + "\r\n";
+                        sendto(mt_sock, to_send.c_str(), to_send.size(), 0, (struct sockaddr*)&mt_addr, sizeof(mt_addr));
                     }
                 }
             }
+            // Drop fully-consumed data in one shot; keep any partial trailing sentence
+            leftover.erase(0, start);
         }
     }
 
