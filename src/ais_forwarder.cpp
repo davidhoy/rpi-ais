@@ -204,6 +204,8 @@ inline bool is_tracking_msg_type(const std::string& payload) {
     return (t >= 1 && t <= 27) && ((allowed >> t) & 1u);
 }
 
+enum class ForwardDecision { Forward, Duplicate, TypeFiltered, RateLimited };
+
 // Per-MMSI rate limiter. Handles single-part and multi-part NMEA messages.
 // Multi-part messages (fragment_count > 1) share a forwarding decision across
 // all fragments so the message either goes out complete or is dropped entirely.
@@ -212,8 +214,8 @@ public:
     MmsiRateLimiter(int interval_s, bool filter_types = true)
         : interval_s_(interval_s), filter_types_(filter_types) {}
 
-    bool should_forward(const std::string& nmea) {
-        if (interval_s_ <= 0) return true;
+    ForwardDecision should_forward(const std::string& nmea) {
+        if (interval_s_ <= 0 && !filter_types_) return ForwardDecision::Forward;
 
         // Locate the starts of fields 0-5 (needs 5 commas minimum)
         size_t f[6] = {0};
@@ -221,7 +223,7 @@ public:
         for (size_t i = 0; i < nmea.size() && n < 6; ++i) {
             if (nmea[i] == ',') f[n++] = i + 1;
         }
-        if (n < 6) return true;  // Malformed — forward to be safe
+        if (n < 6) return ForwardDecision::Forward;  // Malformed — forward to be safe
 
         int total   = nmea[f[1]] - '0';
         int num     = nmea[f[2]] - '0';
@@ -235,8 +237,8 @@ public:
         std::string payload = nmea.substr(f[5], payload_end - f[5]);
 
         if (total == 1) {
-            if (filter_types_ && !is_tracking_msg_type(payload)) return false;
-            return check_and_update(extract_mmsi(payload));
+            if (filter_types_ && !is_tracking_msg_type(payload)) return ForwardDecision::TypeFiltered;
+            return check_and_update(extract_mmsi(payload)) ? ForwardDecision::Forward : ForwardDecision::RateLimited;
         }
 
         // Multi-part: key by channel + seq_id so concurrent messages don't collide
@@ -244,18 +246,21 @@ public:
         std::string key(mkey);
 
         if (num == 1) {
-            // Type filter applies to fragment 1; decision is propagated to later fragments
-            bool fwd = (!filter_types_ || is_tracking_msg_type(payload)) &&
-                       check_and_update(extract_mmsi(payload));
-            multipart_[key] = {fwd, std::chrono::steady_clock::now()};
-            return fwd;
+            // Type filter and rate limit apply to fragment 1; decision propagates to later fragments
+            ForwardDecision decision;
+            if (filter_types_ && !is_tracking_msg_type(payload))
+                decision = ForwardDecision::TypeFiltered;
+            else
+                decision = check_and_update(extract_mmsi(payload)) ? ForwardDecision::Forward : ForwardDecision::RateLimited;
+            multipart_[key] = {decision, std::chrono::steady_clock::now()};
+            return decision;
         }
 
         auto it = multipart_.find(key);
-        bool fwd = (it != multipart_.end()) ? it->second.first : true;
+        ForwardDecision decision = (it != multipart_.end()) ? it->second.first : ForwardDecision::Forward;
         if (num == total && it != multipart_.end())
             multipart_.erase(it);
-        return fwd;
+        return decision;
     }
 
     // Remove stale entries; call periodically to bound memory use
@@ -286,7 +291,7 @@ private:
     bool filter_types_;
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_sent_;
     // Tracks forwarding decision for in-progress multi-part messages
-    std::unordered_map<std::string, std::pair<bool, std::chrono::steady_clock::time_point>> multipart_;
+    std::unordered_map<std::string, std::pair<ForwardDecision, std::chrono::steady_clock::time_point>> multipart_;
 };
 
 // Drops AIS sentences that are channel-A/B duplicates of the same transmission.
@@ -334,6 +339,60 @@ public:
 private:
     int ttl_ms_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> seen_;
+};
+
+static std::string fmt_bytes(uint64_t b) {
+    char buf[32];
+    if (b < 1024) snprintf(buf, sizeof(buf), "%lluB", (unsigned long long)b);
+    else if (b < 1024*1024) snprintf(buf, sizeof(buf), "%.1fKB", b / 1024.0);
+    else snprintf(buf, sizeof(buf), "%.2fMB", b / (1024.0 * 1024.0));
+    return buf;
+}
+
+struct BandwidthStats {
+    uint64_t received_bytes = 0, forwarded_bytes = 0;
+    uint64_t dedup_bytes = 0, type_bytes = 0, rate_bytes = 0;
+    uint64_t received_msgs = 0, forwarded_msgs = 0;
+
+    void record(uint64_t size, bool is_dup, ForwardDecision decision) {
+        received_bytes += size;
+        received_msgs++;
+        if (is_dup) {
+            dedup_bytes += size;
+        } else {
+            switch (decision) {
+                case ForwardDecision::Forward:
+                    forwarded_bytes += size; forwarded_msgs++; break;
+                case ForwardDecision::TypeFiltered:
+                    type_bytes += size; break;
+                case ForwardDecision::RateLimited:
+                    rate_bytes += size; break;
+                default: break;
+            }
+        }
+    }
+
+    void reset() {
+        received_bytes = forwarded_bytes = dedup_bytes = type_bytes = rate_bytes = 0;
+        received_msgs = forwarded_msgs = 0;
+    }
+
+    std::string report(const std::string& label) const {
+        uint64_t saved = received_bytes > forwarded_bytes ? received_bytes - forwarded_bytes : 0;
+        double pct = received_bytes > 0 ? 100.0 * saved / received_bytes : 0.0;
+        double cost = forwarded_bytes / (1024.0 * 1024.0 * 1024.0) * 2.0;
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+            "Bandwidth %s: sent %s (%llu msgs) | would-send %s (%llu msgs) | "
+            "saved %.1f%% [dedup %s | type %s | rate %s] | ~$%.5f @$2/GB",
+            label.c_str(),
+            fmt_bytes(forwarded_bytes).c_str(), (unsigned long long)forwarded_msgs,
+            fmt_bytes(received_bytes).c_str(),  (unsigned long long)received_msgs,
+            pct,
+            fmt_bytes(dedup_bytes).c_str(), fmt_bytes(type_bytes).c_str(), fmt_bytes(rate_bytes).c_str(),
+            cost);
+        return buf;
+    }
 };
 
 // Function to set socket timeout
@@ -578,6 +637,7 @@ int main(int argc, char* argv[]) {
 
     MmsiRateLimiter limiter(config.rate_limit_seconds, config.filter_msg_types);
     PayloadDeduplicator deduplicator;
+    BandwidthStats window_stats, total_stats;
     auto last_cleanup = std::chrono::steady_clock::now();
     const auto cleanup_interval = std::chrono::minutes(5);
 
@@ -632,6 +692,9 @@ int main(int argc, char* argv[]) {
             if (now - last_cleanup >= cleanup_interval) {
                 limiter.cleanup();
                 deduplicator.cleanup();
+                std::cout << get_timestamp() << " - " << window_stats.report("(last 5m)") << std::endl;
+                std::cout << get_timestamp() << " - " << total_stats.report("(total)") << std::endl;
+                window_stats.reset();
                 last_cleanup = now;
             }
             if (now - last_health_check >= health_check_interval) {
@@ -734,13 +797,18 @@ int main(int argc, char* argv[]) {
                 std::string nmea_str = leftover.substr(start, pos - start);
                 start = pos + 2;
 
-                // Filter out unwanted messages
+                // Filter, forward, and record stats for AIS sentences
                 if (nmea_str.rfind("!AIVDM", 0) == 0 || nmea_str.rfind("!AIVDO", 0) == 0) {
-                    if (deduplicator.is_new(nmea_str) && limiter.should_forward(nmea_str)) {
-                        // Restore NMEA-standard \r\n terminator stripped during parsing
+                    size_t msg_size = nmea_str.size() + 2;  // +2 for restored \r\n
+                    bool is_dup = !deduplicator.is_new(nmea_str);
+                    ForwardDecision decision = is_dup ? ForwardDecision::Duplicate
+                                                      : limiter.should_forward(nmea_str);
+                    if (decision == ForwardDecision::Forward) {
                         std::string to_send = nmea_str + "\r\n";
                         sendto(mt_sock, to_send.c_str(), to_send.size(), 0, (struct sockaddr*)&mt_addr, sizeof(mt_addr));
                     }
+                    window_stats.record(msg_size, is_dup, decision);
+                    total_stats.record(msg_size, is_dup, decision);
                 }
             }
             // Drop fully-consumed data in one shot; keep any partial trailing sentence
