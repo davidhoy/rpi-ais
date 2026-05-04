@@ -52,7 +52,7 @@ struct Config {
     int mt_port = 10170;                       // Default MarineTraffic port
     std::string notification_user = "david";   // User for desktop notifications
     std::string config_file = "";             // Optional config file path
-    int rate_limit_seconds = 30;             // Seconds between forwarding same MMSI (0 = disabled)
+    int rate_limit_seconds = 0;              // Seconds between forwarding same MMSI (0 = disabled; set >0 for metered links)
     bool filter_msg_types = true;            // Drop non-tracking message types
 };
 
