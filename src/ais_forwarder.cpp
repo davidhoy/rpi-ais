@@ -32,6 +32,7 @@
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <unordered_map>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -51,6 +52,7 @@ struct Config {
     int mt_port = 10170;                       // Default MarineTraffic port
     std::string notification_user = "david";   // User for desktop notifications
     std::string config_file = "";             // Optional config file path
+    int rate_limit_seconds = 30;             // Seconds between forwarding same MMSI (0 = disabled)
 };
 
 // Function to load configuration from file
@@ -82,6 +84,7 @@ bool load_config_file(const std::string& filename, Config& config) {
         else if (key == "mt_ip") config.mt_ip = value;
         else if (key == "mt_port") config.mt_port = std::stoi(value);
         else if (key == "notification_user") config.notification_user = value;
+        else if (key == "rate_limit_seconds") config.rate_limit_seconds = std::stoi(value);
     }
     
     return true;
@@ -105,6 +108,9 @@ void load_env_config(Config& config) {
     }
     if ((env_val = getenv("NOTIFICATION_USER")) != nullptr) {
         config.notification_user = env_val;
+    }
+    if ((env_val = getenv("RATE_LIMIT_SECONDS")) != nullptr) {
+        config.rate_limit_seconds = std::stoi(env_val);
     }
 }
 
@@ -131,6 +137,7 @@ void show_usage(const char* program_name) {
               << "  mt_ip=5.9.207.224\n"
               << "  mt_port=10170\n"
               << "  notification_user=david\n"
+              << "  rate_limit_seconds=30\n"
               << "\nPriority: Command line > Environment > Config file > Defaults\n";
 }
 
@@ -154,6 +161,105 @@ std::string get_timestamp() {
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t));
     return std::string(buffer);
 }
+
+// Decode one character of AIS 6-bit ASCII payload to its 6-bit value
+inline int decode_ais_char(char c) {
+    int v = c - 48;
+    return (v > 39 ? v - 8 : v) & 0x3F;
+}
+
+// Extract 30-bit MMSI from AIS payload (bits 8–37); returns 0 on failure
+uint32_t extract_mmsi(const std::string& payload) {
+    if (payload.size() < 7) return 0;
+    int c1 = decode_ais_char(payload[1]);
+    int c2 = decode_ais_char(payload[2]);
+    int c3 = decode_ais_char(payload[3]);
+    int c4 = decode_ais_char(payload[4]);
+    int c5 = decode_ais_char(payload[5]);
+    int c6 = decode_ais_char(payload[6]);
+    return static_cast<uint32_t>(
+        ((c1 & 0xF) << 26) | (c2 << 20) | (c3 << 14) | (c4 << 8) | (c5 << 2) | (c6 >> 4));
+}
+
+// Per-MMSI rate limiter. Handles single-part and multi-part NMEA messages.
+// Multi-part messages (fragment_count > 1) share a forwarding decision across
+// all fragments so the message either goes out complete or is dropped entirely.
+class MmsiRateLimiter {
+public:
+    explicit MmsiRateLimiter(int interval_s) : interval_s_(interval_s) {}
+
+    bool should_forward(const std::string& nmea) {
+        if (interval_s_ <= 0) return true;
+
+        // Locate the starts of fields 0-5 (needs 5 commas minimum)
+        size_t f[6] = {0};
+        int n = 1;
+        for (size_t i = 0; i < nmea.size() && n < 6; ++i) {
+            if (nmea[i] == ',') f[n++] = i + 1;
+        }
+        if (n < 6) return true;  // Malformed — forward to be safe
+
+        int total   = nmea[f[1]] - '0';
+        int num     = nmea[f[2]] - '0';
+        // seq_id field is between f[3] and f[4]-1; empty for single-part messages
+        char seq_id = (f[4] > f[3] + 1) ? nmea[f[3]] : '0';
+        char channel = nmea[f[4]];
+
+        // Payload runs from f[5] to the next comma (or end of string)
+        size_t payload_end = nmea.find(',', f[5]);
+        if (payload_end == std::string::npos) payload_end = nmea.size();
+        std::string payload = nmea.substr(f[5], payload_end - f[5]);
+
+        if (total == 1) {
+            return check_and_update(extract_mmsi(payload));
+        }
+
+        // Multi-part: key by channel + seq_id so concurrent messages don't collide
+        char mkey[3] = {channel, seq_id, '\0'};
+        std::string key(mkey);
+
+        if (num == 1) {
+            bool fwd = check_and_update(extract_mmsi(payload));
+            multipart_[key] = {fwd, std::chrono::steady_clock::now()};
+            return fwd;
+        }
+
+        auto it = multipart_.find(key);
+        bool fwd = (it != multipart_.end()) ? it->second.first : true;
+        if (num == total && it != multipart_.end())
+            multipart_.erase(it);
+        return fwd;
+    }
+
+    // Remove stale entries; call periodically to bound memory use
+    void cleanup() {
+        auto now = std::chrono::steady_clock::now();
+        auto ttl = std::chrono::seconds(interval_s_ * 2);
+        for (auto it = last_sent_.begin(); it != last_sent_.end(); )
+            it = (now - it->second >= ttl) ? last_sent_.erase(it) : ++it;
+        auto mp_ttl = std::chrono::seconds(30);
+        for (auto it = multipart_.begin(); it != multipart_.end(); )
+            it = (now - it->second.second >= mp_ttl) ? multipart_.erase(it) : ++it;
+    }
+
+private:
+    bool check_and_update(uint32_t mmsi) {
+        if (!mmsi) return true;  // Decode failed — forward
+        auto now = std::chrono::steady_clock::now();
+        auto& ts = last_sent_[mmsi];
+        if (ts == std::chrono::steady_clock::time_point{} ||
+                now - ts >= std::chrono::seconds(interval_s_)) {
+            ts = now;
+            return true;
+        }
+        return false;
+    }
+
+    int interval_s_;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_sent_;
+    // Tracks forwarding decision for in-progress multi-part messages
+    std::unordered_map<std::string, std::pair<bool, std::chrono::steady_clock::time_point>> multipart_;
+};
 
 // Function to set socket timeout
 bool set_socket_timeout(int socket_fd, int timeout_seconds) {
@@ -376,6 +482,10 @@ int main(int argc, char* argv[]) {
     std::cout << "  AIS: " << config.ais_ip << ":" << config.ais_port << std::endl;
     std::cout << "  MarineTraffic: " << config.mt_ip << ":" << config.mt_port << std::endl;
     std::cout << "  Notification User: " << config.notification_user << std::endl;
+    if (config.rate_limit_seconds > 0)
+        std::cout << "  Rate Limit: " << config.rate_limit_seconds << "s per MMSI" << std::endl;
+    else
+        std::cout << "  Rate Limit: disabled" << std::endl;
 
     // UDP Socket for MarineTraffic
     int mt_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -390,11 +500,15 @@ int main(int argc, char* argv[]) {
     mt_addr.sin_port = htons(config.mt_port);
     inet_pton(AF_INET, config.mt_ip.c_str(), &mt_addr.sin_addr);
 
+    MmsiRateLimiter limiter(config.rate_limit_seconds);
+    auto last_cleanup = std::chrono::steady_clock::now();
+    const auto cleanup_interval = std::chrono::minutes(5);
+
     int ais_sock = -1;
     bool was_connected = false;  // Track previous connection state
     bool connection_lost_notified = false;  // Track if we've already notified about loss
     std::string leftover;  // To store any incomplete NMEA sentence from previous reads
-    
+
     while (true) {
         // Try to establish/maintain AIS connection
         if (ais_sock == -1) {
@@ -438,6 +552,10 @@ int main(int argc, char* argv[]) {
         while (ais_sock != -1) {
             // Periodic connection health check
             auto now = std::chrono::steady_clock::now();
+            if (now - last_cleanup >= cleanup_interval) {
+                limiter.cleanup();
+                last_cleanup = now;
+            }
             if (now - last_health_check >= health_check_interval) {
                 if (!is_connection_alive(ais_sock)) {
                     std::string error_msg = "AIS connection health check failed - connection lost";
@@ -543,8 +661,9 @@ int main(int argc, char* argv[]) {
 
                 // Filter out unwanted messages
                 if (nmea_str.rfind("!AIVDM", 0) == 0 || nmea_str.rfind("!AIVDO", 0) == 0) {
-                    // Send NMEA string to MarineTraffic
-                    sendto(mt_sock, nmea_str.c_str(), nmea_str.size(), 0, (struct sockaddr*)&mt_addr, sizeof(mt_addr));
+                    if (limiter.should_forward(nmea_str)) {
+                        sendto(mt_sock, nmea_str.c_str(), nmea_str.size(), 0, (struct sockaddr*)&mt_addr, sizeof(mt_addr));
+                    }
                 }
             }
         }
