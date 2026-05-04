@@ -53,6 +53,7 @@ struct Config {
     std::string notification_user = "david";   // User for desktop notifications
     std::string config_file = "";             // Optional config file path
     int rate_limit_seconds = 30;             // Seconds between forwarding same MMSI (0 = disabled)
+    bool filter_msg_types = true;            // Drop non-tracking message types
 };
 
 // Function to load configuration from file
@@ -85,6 +86,7 @@ bool load_config_file(const std::string& filename, Config& config) {
         else if (key == "mt_port") config.mt_port = std::stoi(value);
         else if (key == "notification_user") config.notification_user = value;
         else if (key == "rate_limit_seconds") config.rate_limit_seconds = std::stoi(value);
+        else if (key == "filter_msg_types") config.filter_msg_types = (value != "0" && value != "false");
     }
     
     return true;
@@ -112,6 +114,9 @@ void load_env_config(Config& config) {
     if ((env_val = getenv("RATE_LIMIT_SECONDS")) != nullptr) {
         config.rate_limit_seconds = std::stoi(env_val);
     }
+    if ((env_val = getenv("FILTER_MSG_TYPES")) != nullptr) {
+        config.filter_msg_types = (std::string(env_val) != "0" && std::string(env_val) != "false");
+    }
 }
 
 // Function to show usage information
@@ -138,6 +143,7 @@ void show_usage(const char* program_name) {
               << "  mt_port=10170\n"
               << "  notification_user=david\n"
               << "  rate_limit_seconds=30\n"
+              << "  filter_msg_types=1\n"
               << "\nPriority: Command line > Environment > Config file > Defaults\n";
 }
 
@@ -181,12 +187,30 @@ uint32_t extract_mmsi(const std::string& payload) {
         ((c1 & 0xF) << 26) | (c2 << 20) | (c3 << 14) | (c4 << 8) | (c5 << 2) | (c6 >> 4));
 }
 
+// Returns true if the AIS message type in this payload should be forwarded.
+// Keeps types useful for vessel tracking; drops ACKs, interrogations, binary
+// application messages, and channel-management traffic.
+inline bool is_tracking_msg_type(const std::string& payload) {
+    if (payload.empty()) return true;
+    int t = decode_ais_char(payload[0]);
+    // 1-3: Class A position   4: base station      5: Class A static/voyage
+    // 9: SAR aircraft pos     14: safety broadcast
+    // 18-19: Class B position 21: aid-to-navigation
+    // 24: Class B static      27: long-range position
+    static const uint32_t allowed =
+        (1u << 1)  | (1u << 2)  | (1u << 3)  | (1u << 4)  | (1u << 5) |
+        (1u << 9)  | (1u << 14) | (1u << 18) | (1u << 19) |
+        (1u << 21) | (1u << 24) | (1u << 27);
+    return (t >= 1 && t <= 27) && ((allowed >> t) & 1u);
+}
+
 // Per-MMSI rate limiter. Handles single-part and multi-part NMEA messages.
 // Multi-part messages (fragment_count > 1) share a forwarding decision across
 // all fragments so the message either goes out complete or is dropped entirely.
 class MmsiRateLimiter {
 public:
-    explicit MmsiRateLimiter(int interval_s) : interval_s_(interval_s) {}
+    MmsiRateLimiter(int interval_s, bool filter_types = true)
+        : interval_s_(interval_s), filter_types_(filter_types) {}
 
     bool should_forward(const std::string& nmea) {
         if (interval_s_ <= 0) return true;
@@ -211,6 +235,7 @@ public:
         std::string payload = nmea.substr(f[5], payload_end - f[5]);
 
         if (total == 1) {
+            if (filter_types_ && !is_tracking_msg_type(payload)) return false;
             return check_and_update(extract_mmsi(payload));
         }
 
@@ -219,7 +244,9 @@ public:
         std::string key(mkey);
 
         if (num == 1) {
-            bool fwd = check_and_update(extract_mmsi(payload));
+            // Type filter applies to fragment 1; decision is propagated to later fragments
+            bool fwd = (!filter_types_ || is_tracking_msg_type(payload)) &&
+                       check_and_update(extract_mmsi(payload));
             multipart_[key] = {fwd, std::chrono::steady_clock::now()};
             return fwd;
         }
@@ -256,6 +283,7 @@ private:
     }
 
     int interval_s_;
+    bool filter_types_;
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_sent_;
     // Tracks forwarding decision for in-progress multi-part messages
     std::unordered_map<std::string, std::pair<bool, std::chrono::steady_clock::time_point>> multipart_;
@@ -533,6 +561,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  Rate Limit: " << config.rate_limit_seconds << "s per MMSI" << std::endl;
     else
         std::cout << "  Rate Limit: disabled" << std::endl;
+    std::cout << "  Msg Type Filter: " << (config.filter_msg_types ? "enabled" : "disabled") << std::endl;
 
     // UDP Socket for MarineTraffic
     int mt_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -547,7 +576,7 @@ int main(int argc, char* argv[]) {
     mt_addr.sin_port = htons(config.mt_port);
     inet_pton(AF_INET, config.mt_ip.c_str(), &mt_addr.sin_addr);
 
-    MmsiRateLimiter limiter(config.rate_limit_seconds);
+    MmsiRateLimiter limiter(config.rate_limit_seconds, config.filter_msg_types);
     PayloadDeduplicator deduplicator;
     auto last_cleanup = std::chrono::steady_clock::now();
     const auto cleanup_interval = std::chrono::minutes(5);
